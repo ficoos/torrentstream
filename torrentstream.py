@@ -3,13 +3,19 @@
 import os
 import time
 import sys
+import argparse
 
 import libtorrent as lt
 
 STATE_STR = ['queued', 'checking', 'downloading metadata',
              'downloading', 'finished', 'seeding', 'allocating']
 
+K = 1 << 10
+M = 1 << 20
+G = 1 << 30
+
 REQUIRED_FROM_END = 10
+
 
 def tty_size():
     return (int(i) for i in os.popen('stty size', 'r').read().split())
@@ -23,64 +29,92 @@ def status_line(format, *args):
     sys.stdout.write(' ' * (columns - len(data) - 1))
     sys.stdout.flush()
 
-magnet = sys.argv[1]
 
-session = lt.session()
+def format_bytes(b):
+    if b < K:
+        return "%db" % (b)
+    if b < M:
+        return "%.1fKb" % (b / K)
+    if b < G:
+        return "%.1fMb" % (b / M)
 
-status_line("listening...")
-session.listen_on(6881, 6891)
+    return "%.1fGb" % (b / G)
 
-params = {
-    'save_path': '.',
-    'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-}
-handle = lt.add_magnet_uri(session, magnet, params)
-while (handle.status().state in [0, 1, 2]):
-    status_line('%s...', STATE_STR[handle.status().state])
-    time.sleep(1)
 
-torrent_info = handle.get_torrent_info()
-start_mark = 0
-end_mark = torrent_info.num_pieces() -1
-piece_length = torrent_info.piece_length() / 1024 / 1024
-num_pieces = torrent_info.num_pieces()
+def download(uri, download_from_end=10*M):
+    session = lt.session()
+    status_line("listening...")
+    session.listen_on(6881, 6891)
+    params = {
+        'save_path': '.',
+        'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+    }
 
-s = handle.status()
-while (not s.is_seeding):
-    if start_mark < num_pieces:
-        while handle.have_piece(start_mark):
+    handle = lt.add_magnet_uri(session, uri, params)
+    while (handle.status().state in [0, 1, 2]):
+        status_line('%s...', STATE_STR[handle.status().state])
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print('Exit requested')
+            sys.exit(1)
+
+    torrent_info = handle.get_torrent_info()
+    start_mark = 0
+    end_mark = torrent_info.num_pieces() - 1
+    piece_length = torrent_info.piece_length()
+    num_pieces = torrent_info.num_pieces()
+
+    s = handle.status()
+    while (not s.is_seeding):
+        while start_mark < num_pieces and handle.have_piece(start_mark):
             start_mark += 1
 
-        handle.set_piece_deadline(start_mark, 1000, 0)
+        if start_mark < num_pieces:
+            handle.set_piece_deadline(start_mark, 1000, 0)
 
-    if end_mark > 0:
-        while handle.have_piece(end_mark):
+        while end_mark > 0 and handle.have_piece(end_mark):
             end_mark -= 1
 
-        if (num_pieces - end_mark) * piece_length < REQUIRED_FROM_END:
-            handle.set_piece_deadline(end_mark, 1000, 0)
+        if end_mark > 0:
+            if (num_pieces - end_mark) * piece_length < download_from_end:
+                handle.set_piece_deadline(end_mark, 1000, 0)
 
-    s = handle.status()
-    status_line('%.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d mark: %.1f / %.1f) %s',
-                s.progress * 100,
-                s.download_rate / 1000,
-                s.upload_rate / 1000,
-                s.num_peers,
-                start_mark * piece_length,
-                (torrent_info.num_pieces() - end_mark) * piece_length,
-                STATE_STR[s.state])
-    try:
-        time.sleep(1)
-    except KeyboardInterrupt:
-        print('Exit requested')
-        sys.exit(1)
+        s = handle.status()
+        status_line(('%s : %.2f%% complete (down: %s/s up: %s/s peers:'
+                     ' %d downloaded: [ %s : %s ])'),
+                    STATE_STR[s.state],
+                    s.progress * 100,
+                    format_bytes(s.download_rate),
+                    format_bytes(s.upload_rate),
+                    s.num_peers,
+                    format_bytes(start_mark * piece_length),
+                    format_bytes((num_pieces - end_mark - 1) * piece_length))
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print('Exit requested')
+            sys.exit(1)
 
-while s.is_seeding():
-    s = handle.status()
-    status_line("Seeding")
+    while s.is_seeding:
+        s = handle.status()
+        status_line("Seeding...")
 
-    try:
-        time.sleep(1)
-    except KeyboardInterrupt:
-        print('Exit requested')
-        sys.exit(0)
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print('Exit requested')
+            sys.exit(0)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Stream a torrent to disk")
+    parser.add_argument('magnet_uri', metavar='magnet-uri', type=str,
+                        help='magnet uri of the file to download')
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    options = parse_args()
+    download(options.magnet_uri)
